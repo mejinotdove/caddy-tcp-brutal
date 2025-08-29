@@ -1,0 +1,32 @@
+{
+  "admin": {
+    "listen": ":8081"
+  },
+  "apps": {
+    "http": {
+      "servers": {
+        "srv0": {
+          "listen": [":8080"],
+          "listener_wrappers": [
+            {
+              "wrapper": "tcp_brutal",
+              "enabled": true,
+              "rate_bps": 25000000,
+              "cwnd_gain": 20
+            }
+          ],
+          "routes": [
+            {
+              "handle": [
+                {
+                  "handler": "file_server",
+                  "root": "/var/www"
+                }
+              ]
+            }
+          ]
+        }
+      }
+    }
+  }
+}
