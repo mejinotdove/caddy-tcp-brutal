@@ -1,4 +1,4 @@
-module github.com/maintell/caddy-tcp-brutal
+module github.com/mejinotdove/caddy-tcp-brutal
 
 go 1.25
 

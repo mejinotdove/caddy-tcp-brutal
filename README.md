@@ -24,7 +24,13 @@ Or build Caddy with the module:
 
 ```sh
 go install github.com/caddyserver/xcaddy@latest
-xcaddy build --with github.com/maintell/caddy-tcp-brutal
+xcaddy build --with github.com/mejinotdove/caddy-tcp-brutal
+```
+
+To build against the current local checkout instead of fetching the published module, run this from the repository root:
+
+```sh
+xcaddy build v2.10.2 --with github.com/mejinotdove/caddy-tcp-brutal=.
 ```
 
 ## Configuration
