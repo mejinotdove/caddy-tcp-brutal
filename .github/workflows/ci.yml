@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - run: go test -race ./...
+      - run: go vet ./...
+      - name: Build Linux architectures
+        run: |
+          for arch in amd64 arm64 386 arm; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build ./...
+          done

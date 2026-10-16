@@ -1,0 +1,18 @@
+{
+	admin 127.0.0.1:8081
+	servers {
+		listener_wrappers {
+			tcp_brutal {
+				rate_bytes_per_second 25000000
+				cwnd_gain 20
+				failure_mode fallback
+			}
+			tls
+		}
+	}
+}
+
+http://:8080 {
+	root * /var/www
+	file_server
+}

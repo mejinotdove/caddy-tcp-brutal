@@ -1,6 +1,6 @@
 {
   "admin": {
-    "listen": ":8081"
+    "listen": "127.0.0.1:8081"
   },
   "apps": {
     "http": {
@@ -11,8 +11,12 @@
             {
               "wrapper": "tcp_brutal",
               "enabled": true,
-              "rate_bps": 25000000,
-              "cwnd_gain": 20
+              "rate_bytes_per_second": 25000000,
+              "cwnd_gain": 20,
+              "failure_mode": "fallback"
+            },
+            {
+              "wrapper": "tls"
             }
           ],
           "routes": [

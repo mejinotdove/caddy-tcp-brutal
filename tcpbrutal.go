@@ -1,133 +1,243 @@
-// tcp_brutal_listener.go
 package tcpbrutal
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"syscall"
-	"unsafe"
+	"time"
 
 	"github.com/caddyserver/caddy/v2"
-	"golang.org/x/sys/unix"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
-// Module implements a Caddy listener wrapper that enables tcp-brutal on accepted TCP connections.
+const (
+	defaultRate = uint64(25_000_000)
+	defaultGain = uint32(20)
+	minRate     = uint64(62_500)
+	maxRate     = uint64(125_000_000_000)
+)
+
+// Module configures tcp-brutal for accepted TCP connections.
 type Module struct {
-	Enabled       bool   `json:"enabled,omitempty"`
-	RateBytesPerS uint64 `json:"rate_bps,omitempty"`  // bytes per second, default 25_000_000 (200 Mbps)
-	CwndGain      uint32 `json:"cwnd_gain,omitempty"` // cwnd gain in tenths (e.g. 20 => 2.0)
+	// Enabled activates tcp-brutal after the startup availability probe succeeds.
+	Enabled bool `json:"enabled,omitempty"`
+	// RateBytesPerS is the legacy rate field, measured in bytes per second.
+	RateBytesPerS uint64 `json:"rate_bps,omitempty"`
+	// CwndGain is the congestion-window gain in tenths; its default is 20.
+	CwndGain uint32 `json:"cwnd_gain,omitempty"`
+	// RateBytesPerSecond is the preferred per-connection rate, in bytes per second.
+	RateBytesPerSecond uint64 `json:"rate_bytes_per_second,omitempty"`
+	// GroupID selects a tcp-brutal v2 shared group; zero disables grouping.
+	GroupID uint64 `json:"group_id,omitempty"`
+	// FailureMode is fallback (default) or strict when probing or configuring sockets fails.
+	FailureMode string `json:"failure_mode,omitempty"`
+	logger      *zap.Logger
+	probe       func(rate uint64, cwnd uint32, group uint64) error
+	probeFailed bool
 }
 
-func init() {
-	// register pointer so pointer-receiver methods are available at runtime
-	caddy.RegisterModule(&Module{})
-}
+func init() { caddy.RegisterModule(&Module{}) }
 
 func (Module) CaddyModule() caddy.ModuleInfo {
-	return caddy.ModuleInfo{
-		ID:  "caddy.listeners.tcp_brutal",
-		New: func() caddy.Module { return &Module{} },
-	}
+	return caddy.ModuleInfo{ID: "caddy.listeners.tcp_brutal", New: func() caddy.Module { return &Module{} }}
 }
 
-// Ensure at compile-time that *Module implements caddy.ListenerWrapper
-var _ caddy.ListenerWrapper = (*Module)(nil)
+var (
+	_ caddy.ListenerWrapper = (*Module)(nil)
+	_ caddy.Provisioner     = (*Module)(nil)
+	_ caddy.Validator       = (*Module)(nil)
+)
 
-// WrapListener implements caddy.ListenerWrapper
-// Note: matches Caddy v2.10.x signature: WrapListener(net.Listener) net.Listener
+func (m *Module) normalize() error {
+	if m.RateBytesPerSecond != 0 && m.RateBytesPerS != 0 && m.RateBytesPerSecond != m.RateBytesPerS {
+		return fmt.Errorf("rate_bytes_per_second and rate_bps differ")
+	}
+	rate := m.RateBytesPerSecond
+	if rate == 0 {
+		rate = m.RateBytesPerS
+	}
+	if rate == 0 {
+		rate = defaultRate
+	}
+	if rate < minRate || rate > maxRate {
+		return fmt.Errorf("rate must be between %d and %d bytes per second", minRate, maxRate)
+	}
+	if m.CwndGain == 0 {
+		m.CwndGain = defaultGain
+	}
+	if m.CwndGain < 5 || m.CwndGain > 80 {
+		return fmt.Errorf("cwnd_gain must be between 5 and 80")
+	}
+	if m.FailureMode == "" {
+		m.FailureMode = "fallback"
+	}
+	if m.FailureMode != "fallback" && m.FailureMode != "strict" {
+		return fmt.Errorf("failure_mode must be fallback or strict")
+	}
+	m.RateBytesPerSecond = rate
+	m.RateBytesPerS = rate
+	return nil
+}
+
+func (m *Module) Validate() error { return m.normalize() }
+
+func (m *Module) Provision(ctx caddy.Context) error {
+	if err := m.normalize(); err != nil {
+		return err
+	}
+	m.probeFailed = false
+	m.logger = sampledLogger(ctx.Logger())
+	if !m.Enabled {
+		return nil
+	}
+	if m.logger != nil {
+		m.logger.Info("tcp_brutal configuration", zap.Uint64("rate_bytes_per_second", m.RateBytesPerSecond), zap.Uint32("cwnd_gain", m.CwndGain), zap.Uint64("group_id", m.GroupID), zap.String("failure_mode", m.FailureMode))
+	}
+	probe := m.probe
+	if probe == nil {
+		probe = platformProbe
+	}
+	if err := probe(m.RateBytesPerSecond, m.CwndGain, m.GroupID); err != nil {
+		if m.FailureMode == "strict" {
+			return fmt.Errorf("tcp_brutal availability probe failed: %w", err)
+		}
+		m.probeFailed = true
+		if m.logger != nil {
+			m.logger.Warn("tcp_brutal unavailable; bypassing this listener wrapper until configuration reload", zap.Error(err))
+		}
+		return nil
+	}
+	return nil
+}
+
+func sampledLogger(logger *zap.Logger) *zap.Logger {
+	if logger == nil {
+		return nil
+	}
+	return logger.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+		return zapcore.NewSamplerWithOptions(core, time.Second, 1, 0)
+	}))
+}
+
 func (m *Module) WrapListener(next net.Listener) net.Listener {
 	if m == nil || !m.Enabled {
 		return next
 	}
-	// defaults
-	if m.RateBytesPerS == 0 {
-		m.RateBytesPerS = 25000000 // 200 Mbps = 200_000_000 bits/s -> 25_000_000 bytes/s
+	if m.probeFailed {
+		return next
 	}
-	if m.CwndGain == 0 {
-		m.CwndGain = 20 // 2.0 by default
-	}
-	return &brutalListener{
-		Listener: next,
-		rate:     m.RateBytesPerS,
-		cwnd:     m.CwndGain,
-	}
+	return &brutalListener{Listener: next, payload: encodeParams(m.RateBytesPerSecond, m.CwndGain, m.GroupID), ops: platformSocketOptions{}, failureMode: m.FailureMode, logger: m.logger}
 }
 
 type brutalListener struct {
 	net.Listener
-	rate uint64
-	cwnd uint32
+	payload     []byte
+	ops         socketOptions
+	failureMode string
+	logger      *zap.Logger
 }
 
-const TCP_BRUTAL_PARAMS = 23301 // from tcp-brutal
-
-// Accept overrides Accept to set tcp-brutal on the accepted socket.
 func (bl *brutalListener) Accept() (net.Conn, error) {
-	conn, err := bl.Listener.Accept()
-	if err != nil {
-		return nil, err
+	for {
+		conn, err := bl.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		safe, setupErr := configureConn(conn, bl.payload, bl.ops)
+		if setupErr == nil {
+			return conn, nil
+		}
+		if bl.logger != nil {
+			bl.logger.Warn("tcp_brutal setup failed", zap.Error(setupErr), zap.String("failure_mode", bl.failureMode))
+		}
+		if bl.failureMode == "fallback" && safe {
+			return conn, nil
+		}
+		_ = conn.Close()
 	}
+}
 
-	// The net.Conn should support SyscallConn (TCP/TLS listeners do).
+type socketOptions interface {
+	congestion(fd int) (string, error)
+	setCongestion(fd int, algorithm string) error
+	setParams(fd int, payload []byte) error
+	version(fd int) (uint32, error)
+}
+
+func configureSocket(fd int, payload []byte, ops socketOptions) (fallbackSafe bool, err error) {
+	previous, err := ops.congestion(fd)
+	if err != nil {
+		return true, fmt.Errorf("read current TCP congestion algorithm: %w", err)
+	}
+	changed := previous != "brutal"
+	if changed {
+		if err = ops.setCongestion(fd, "brutal"); err != nil {
+			return true, fmt.Errorf("switch TCP congestion algorithm to brutal: %w", err)
+		}
+	}
+	if err = ops.setParams(fd, payload); err != nil {
+		setErr := fmt.Errorf("set TCP_BRUTAL_PARAMS: %w", err)
+		if !changed {
+			return true, setErr
+		}
+		if rollbackErr := ops.setCongestion(fd, previous); rollbackErr != nil {
+			return false, errors.Join(setErr, fmt.Errorf("restore TCP congestion algorithm %q: %w", previous, rollbackErr))
+		}
+		return true, setErr
+	}
+	return true, nil
+}
+
+func configureConn(conn net.Conn, payload []byte, ops socketOptions) (fallbackSafe bool, err error) {
+	underlying, err := unwrapConn(conn)
+	if err != nil {
+		return true, err
+	}
 	type syscallConn interface {
 		SyscallConn() (syscall.RawConn, error)
 	}
-
-	if sc, ok := conn.(syscallConn); ok {
-		raw, err := sc.SyscallConn()
-		if err == nil {
-			controlErr := raw.Control(func(fd uintptr) {
-				// 把拥塞算法设为 brutal
-				if err := unix.SetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION, "brutal"); err != nil {
-					fmt.Printf("tcp_brutal: Setsockopt TCP_CONGESTION failed fd=%d err=%v\n", fd, err)
-				} else {
-					// 读取当前拥塞算法并打印（验证设置成功）
-					if alg, err := unix.GetsockoptString(int(fd), unix.IPPROTO_TCP, unix.TCP_CONGESTION); err != nil {
-						fmt.Printf("tcp_brutal: Getsockopt TCP_CONGESTION failed fd=%d err=%v\n", fd, err)
-					} else {
-						fmt.Printf("tcp_brutal: fd=%d congestion=%q\n", fd, alg)
-					}
-				}
-
-				// prepare params struct and set TCP_BRUTAL_PARAMS
-				var params struct {
-					Rate     uint64
-					CwndGain uint32
-				}
-				params.Rate = bl.rate
-				params.CwndGain = bl.cwnd
-
-				_, _, errno := syscall.Syscall6(
-					syscall.SYS_SETSOCKOPT,
-					fd,
-					uintptr(unix.IPPROTO_TCP),
-					uintptr(TCP_BRUTAL_PARAMS),
-					uintptr(unsafe.Pointer(&params)),
-					uintptr(unsafe.Sizeof(params)),
-					0,
-				)
-				if errno != 0 {
-					fmt.Printf("tcp_brutal: setsockopt TCP_BRUTAL_PARAMS failed fd=%d err=%v\n", fd, errno)
-				} else {
-					fmt.Printf("tcp_brutal: fd=%d TCP_BRUTAL_PARAMS set rate=%d cwnd_gain=%d\n", fd, params.Rate, params.CwndGain)
-				}
-			})
-			if controlErr != nil {
-				fmt.Printf("tcp_brutal: raw.Control error: %v\n", controlErr)
-			}
-		} else {
-			fmt.Printf("tcp_brutal: SyscallConn error: %v\n", err)
-		}
-	} else {
-		// Not a socket that supports SyscallConn (rare for net.Listener from Caddy)
-		fmt.Printf("tcp_brutal: accepted conn does not support SyscallConn: %T\n", conn)
+	sc, ok := underlying.(syscallConn)
+	if !ok {
+		return true, fmt.Errorf("connection %T does not support SyscallConn", underlying)
 	}
-
-	return conn, nil
+	raw, err := sc.SyscallConn()
+	if err != nil {
+		return true, fmt.Errorf("get raw connection: %w", err)
+	}
+	var safe = true
+	var configErr error
+	controlErr := raw.Control(func(fd uintptr) { safe, configErr = configureSocket(int(fd), payload, ops) })
+	if controlErr != nil {
+		return safe, fmt.Errorf("raw connection control: %w", errors.Join(configErr, controlErr))
+	}
+	if configErr != nil {
+		return safe, configErr
+	}
+	return true, nil
 }
 
-// Provision is a no-op for now; keep signature to satisfy caddy.Module lifecycle.
-func (m *Module) Provision(ctx caddy.Context) error {
-	// nothing to do
-	return nil
+func unwrapConn(conn net.Conn) (net.Conn, error) {
+	current := conn
+	for depth := 0; depth < 16; depth++ {
+		if current == nil {
+			return nil, fmt.Errorf("connection unwrap returned nil")
+		}
+		if _, ok := current.(interface {
+			SyscallConn() (syscall.RawConn, error)
+		}); ok {
+			return current, nil
+		}
+		if n, ok := current.(interface{ NetConn() net.Conn }); ok {
+			current = n.NetConn()
+			continue
+		}
+		if n, ok := current.(interface{ Unwrap() net.Conn }); ok {
+			current = n.Unwrap()
+			continue
+		}
+		return current, nil
+	}
+	return nil, fmt.Errorf("connection unwrap exceeded depth limit (possible cycle)")
 }
